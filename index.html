@@ -249,6 +249,7 @@ body{font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif
       <button class="zoom-btn" onclick="resetZoom()">⌂</button>
     </div>
     <div class="pan-hint"><kbd>Space</kbd>+tažení · <kbd>Shift</kbd>+klik = více · <kbd>⌘Z</kbd> zpět</div>
+    <div class="pan-hint" style="left:auto;right:16px;bottom:56px;font-size:9px;gap:5px"><span style="width:5px;height:5px;border-radius:50%;background:var(--green);box-shadow:0 0 4px rgba(45,185,80,.4)"></span>Google Sheets</div>
   </div>
 
   <div class="right-panel" id="right-panel">
@@ -283,13 +284,168 @@ function hslToHex(h,s,l){h/=360;s/=100;l/=100;let r,g,b;if(s===0){r=g=b=l}else{c
 function rgbStr(r,g,b){return`rgb(${r},${g},${b})`;}
 function kelvinColor(k){const[r,g,b]=kelvinToRgb(k);return rgbStr(r,g,b);}
 
-// ═══════════ STORAGE ═══════════
-const ST={KEY:'lightplan_v7f',_d(){try{return JSON.parse(localStorage.getItem(this.KEY)||'{}')}catch{return{}}},_s(d){localStorage.setItem(this.KEY,JSON.stringify(d))},
-list(){const d=this._d();const order=JSON.parse(localStorage.getItem(this.KEY+'_order')||'[]');const ids=Object.keys(d);const sorted=order.filter(id=>ids.includes(id));ids.forEach(id=>{if(!sorted.includes(id))sorted.push(id)});return sorted.map(id=>({id,name:d[id].name,updatedAt:d[id].updatedAt}))},
-saveOrder(ids){localStorage.setItem(this.KEY+'_order',JSON.stringify(ids))},
-load(id){return this._d()[id]||null},save(id,data){const d=this._d();d[id]={...data,updatedAt:new Date().toISOString()};this._s(d)},
-create(n){const id='v_'+Date.now().toString(36)+Math.random().toString(36).substr(2,4),p={name:n,objects:[],zoom:1,panX:0,panY:0,nextId:1,bgImage:'',updatedAt:new Date().toISOString()};const d=this._d();d[id]=p;this._s(d);return{id,...p}},
-remove(id){const d=this._d();delete d[id];this._s(d)}};
+// ═══════════ STORAGE (Google Sheets API + localStorage cache) ═══════════
+const SHEETS_CONFIG = {
+  SPREADSHEET_ID: '1y2Ekh610GxEEtLgk35z-wylR3gvSSh-v7jp03RS0mR4',
+  API_KEY: 'AIzaSyA-PPW-DvzZadCFUIj8F-x4YFgzChdzS6s',
+  SHEET_NAME: 'Diagrams',
+  // URL params can override (for Glide WebEmbed)
+  get sheetId(){ return new URLSearchParams(window.location.search).get('sheetId') || this.SPREADSHEET_ID },
+  get apiKey(){ return new URLSearchParams(window.location.search).get('apiKey') || this.API_KEY },
+};
+
+const SHEETS_BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
+
+// Local cache for fast access
+const ST = {
+  KEY: 'lightplan_cloud_v1',
+  _cache() { try { return JSON.parse(localStorage.getItem(this.KEY) || '{}') } catch { return {} } },
+  _saveCache(d) { localStorage.setItem(this.KEY, JSON.stringify(d)) },
+
+  // ─── LIST versions from cache (fast) ───
+  list() {
+    const d = this._cache();
+    const order = JSON.parse(localStorage.getItem(this.KEY + '_order') || '[]');
+    const ids = Object.keys(d);
+    const sorted = order.filter(id => ids.includes(id));
+    ids.forEach(id => { if (!sorted.includes(id)) sorted.push(id) });
+    return sorted.map(id => ({ id, name: d[id].name, updatedAt: d[id].updatedAt }));
+  },
+  saveOrder(ids) { localStorage.setItem(this.KEY + '_order', JSON.stringify(ids)) },
+
+  // ─── LOAD from cache ───
+  load(id) { return this._cache()[id] || null },
+
+  // ─── SAVE to cache + Google Sheets ───
+  save(id, data) {
+    // Save to cache immediately (fast)
+    const d = this._cache();
+    d[id] = { ...data, updatedAt: new Date().toISOString() };
+    this._saveCache(d);
+    // Then sync to Google Sheets (async, non-blocking)
+    this._syncToSheet(id, d[id]);
+  },
+
+  // ─── CREATE new version ───
+  create(n) {
+    const id = 'v_' + Date.now().toString(36) + Math.random().toString(36).substr(2, 4);
+    const p = { name: n, objects: [], zoom: 1, panX: 0, panY: 0, nextId: 1, bgImage: '', updatedAt: new Date().toISOString() };
+    const d = this._cache(); d[id] = p; this._saveCache(d);
+    this._syncToSheet(id, p);
+    return { id, ...p };
+  },
+
+  // ─── REMOVE version ───
+  remove(id) {
+    const d = this._cache(); delete d[id]; this._saveCache(d);
+    this._deleteFromSheet(id);
+  },
+
+  // ─── Google Sheets: write/update row ───
+  async _syncToSheet(orderId, data) {
+    try {
+      const diagramJson = JSON.stringify({
+        objects: data.objects || [],
+        zoom: data.zoom, panX: data.panX, panY: data.panY,
+        nextId: data.nextId, bgImage: data.bgImage || ''
+      });
+      const updatedAt = data.updatedAt || new Date().toISOString();
+      const versionName = data.name || 'Bez názvu';
+
+      // First check if row exists
+      const existing = await this._findRow(orderId);
+      if (existing !== null) {
+        // Update existing row
+        const range = `${SHEETS_CONFIG.SHEET_NAME}!A${existing}:D${existing}`;
+        await fetch(`${SHEETS_BASE}/${SHEETS_CONFIG.sheetId}/values/${range}?valueInputOption=RAW&key=${SHEETS_CONFIG.apiKey}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ values: [[orderId, versionName, diagramJson, updatedAt]] })
+        });
+      } else {
+        // Append new row
+        const range = `${SHEETS_CONFIG.SHEET_NAME}!A:D`;
+        await fetch(`${SHEETS_BASE}/${SHEETS_CONFIG.sheetId}/values/${range}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS&key=${SHEETS_CONFIG.apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ values: [[orderId, versionName, diagramJson, updatedAt]] })
+        });
+      }
+      console.log('[Sheets] Synced:', orderId);
+    } catch (e) {
+      console.warn('[Sheets] Sync failed, data safe in localStorage:', e);
+    }
+  },
+
+  // ─── Google Sheets: find row number by order_id ───
+  async _findRow(orderId) {
+    try {
+      const range = `${SHEETS_CONFIG.SHEET_NAME}!A:A`;
+      const resp = await fetch(`${SHEETS_BASE}/${SHEETS_CONFIG.sheetId}/values/${range}?key=${SHEETS_CONFIG.apiKey}`);
+      const data = await resp.json();
+      if (!data.values) return null;
+      for (let i = 0; i < data.values.length; i++) {
+        if (data.values[i][0] === orderId) return i + 1; // 1-indexed
+      }
+      return null;
+    } catch (e) { console.warn('[Sheets] Find failed:', e); return null; }
+  },
+
+  // ─── Google Sheets: delete row (clear it) ───
+  async _deleteFromSheet(orderId) {
+    try {
+      const row = await this._findRow(orderId);
+      if (row === null) return;
+      const range = `${SHEETS_CONFIG.SHEET_NAME}!A${row}:D${row}`;
+      await fetch(`${SHEETS_BASE}/${SHEETS_CONFIG.sheetId}/values/${range}:clear?key=${SHEETS_CONFIG.apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      console.log('[Sheets] Deleted:', orderId);
+    } catch (e) { console.warn('[Sheets] Delete failed:', e); }
+  },
+
+  // ─── Google Sheets: load ALL data from sheet into cache ───
+  async syncFromSheet() {
+    try {
+      const range = `${SHEETS_CONFIG.SHEET_NAME}!A2:D1000`;
+      const resp = await fetch(`${SHEETS_BASE}/${SHEETS_CONFIG.sheetId}/values/${range}?key=${SHEETS_CONFIG.apiKey}`);
+      const data = await resp.json();
+      if (!data.values || !data.values.length) {
+        console.log('[Sheets] No data in sheet, using local cache');
+        return false;
+      }
+      const cache = {};
+      data.values.forEach(row => {
+        if (!row[0]) return; // skip empty rows
+        const id = row[0];
+        const name = row[1] || 'Bez názvu';
+        let parsed = {};
+        try { parsed = JSON.parse(row[2] || '{}') } catch {}
+        cache[id] = {
+          name,
+          objects: parsed.objects || [],
+          zoom: parsed.zoom || 1,
+          panX: parsed.panX || 0,
+          panY: parsed.panY || 0,
+          nextId: parsed.nextId || 1,
+          bgImage: parsed.bgImage || '',
+          updatedAt: row[3] || ''
+        };
+      });
+      // Merge: sheet data wins over local cache
+      const local = this._cache();
+      const merged = { ...local, ...cache };
+      this._saveCache(merged);
+      console.log('[Sheets] Loaded', Object.keys(cache).length, 'versions from sheet');
+      return true;
+    } catch (e) {
+      console.warn('[Sheets] Load failed, using local cache:', e);
+      return false;
+    }
+  }
+};
 
 // ═══════════ EQUIPMENT ═══════════
 const EQ={
@@ -774,8 +930,37 @@ function buildCards(ids,cid){const ct=document.getElementById(cid);if(!ct)return
 buildCards(SECTIONS.mainLights,'grid-main-lights');buildCards(SECTIONS.modifiers,'grid-modifiers');buildCards(SECTIONS.accessories,'grid-accessories');
 buildCards(SECTIONS.arri,'grid-arri');buildCards(SECTIONS.sony,'grid-sony');buildCards(SECTIONS.red,'grid-red');buildCards(SECTIONS.bm,'grid-bm');
 buildCards(SECTIONS.people,'grid-people');buildCards(SECTIONS.furniture,'grid-furniture');buildCards(SECTIONS.environment,'grid-environment');
-loadVersions();if(!versions.length){const v=ST.create('Verze 1');versions=[{id:v.id,name:v.name,updatedAt:v.updatedAt}]}switchVersion(versions[0].id);
-window.addEventListener('beforeunload',()=>{if(isDirty)saveCurrent()});resizeCanvas();
+
+// ═══════════ INIT: Load from Sheets then start ═══════════
+(async function init(){
+  // Show loading state
+  showToast('Načítání z cloudu…');
+  
+  // Try to sync from Google Sheets
+  const sheetLoaded = await ST.syncFromSheet();
+  
+  // Load version list
+  loadVersions();
+  
+  if(!versions.length){
+    const v = ST.create('Verze 1');
+    versions = [{id:v.id, name:v.name, updatedAt:v.updatedAt}];
+  }
+  
+  // Check URL for specific version/order ID
+  const urlParams = new URLSearchParams(window.location.search);
+  const urlVersion = urlParams.get('versionId') || urlParams.get('orderId');
+  if(urlVersion && versions.find(v=>v.id===urlVersion)){
+    switchVersion(urlVersion);
+  } else {
+    switchVersion(versions[0].id);
+  }
+  
+  showToast(sheetLoaded ? 'Data načtena z Google Sheets' : 'Offline režim (localStorage)');
+  resizeCanvas();
+})();
+
+window.addEventListener('beforeunload',()=>{if(isDirty)saveCurrent()});
 </script>
 </body>
 </html>
